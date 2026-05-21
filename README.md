@@ -1,6 +1,3 @@
-<<<<<<< HEAD
-# AutomationSync
-=======
 # Odoo → Medusa Order Sync — Playwright Automation Tests
 
 ## Flow under test
@@ -138,4 +135,3 @@ race conditions and false failures.
   use that to tune the value.
 - **Codegen**: Run `npx playwright codegen https://your-odoo.com` to record clicks
   and auto-generate selectors for your specific Odoo instance.
->>>>>>> fcce9ec (automation sync)
