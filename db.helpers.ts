@@ -13,6 +13,17 @@ export const SYNC_DB_POLL_TIMEOUT_MS = Number(
 export const SYNC_DB_POLL_INTERVAL_MS = Number(
   process.env.SYNC_DB_POLL_INTERVAL_MS ?? 5_000
 );
+/** Wait after Odoo Create Payment before querying order_transaction (default 30s). */
+export const SYNC_PAYMENT_WAIT_MS = Number(process.env.SYNC_PAYMENT_WAIT_MS ?? 30_000);
+export const SYNC_PAYMENT_POLL_TIMEOUT_MS = Number(
+  process.env.SYNC_PAYMENT_POLL_TIMEOUT_MS ?? 60_000
+);
+export const SYNC_PAYMENT_POLL_INTERVAL_MS = Number(
+  process.env.SYNC_PAYMENT_POLL_INTERVAL_MS ?? 5_000
+);
+/** Expected order_transaction.reference when payment syncs (default: capture). */
+export const ORDER_TRANSACTION_REFERENCE =
+  process.env.ORDER_TRANSACTION_REFERENCE?.trim() || 'capture';
 
 export interface DbConfig {
   host: string;
@@ -622,4 +633,170 @@ export function logLinesComparison(c: LinesComparison): void {
   });
   console.log('  └────┴────────────────────────────────────────────┴──────────┴──────────┴────────┘');
   console.log(`  Overall: ${c.match ? 'ALL PRODUCTS & QUANTITIES MATCH ✓' : 'MISMATCH ✗'}`);
+}
+
+// ─── order_transaction (payment sync) ─────────────────────────────────────────
+
+export type OrderTransactionRow = Record<string, unknown> & {
+  id: string;
+  order_id: string;
+  reference: string;
+};
+
+/** Medusa order primary key, e.g. order_01KS58SHR3SXVKH318Y98TW4EA */
+export function getMedusaOrderIdFromOrderRow(
+  row: Record<string, unknown>
+): string {
+  const id = row.id;
+  if (id == null || id === '') {
+    throw new Error('Order row missing id — cannot query order_transaction');
+  }
+  return String(id);
+}
+
+/**
+ * SELECT * FROM public.order_transaction WHERE order_id = $1 [AND reference = $2]
+ */
+export async function findOrderTransactionsByOrderId(
+  orderId: string,
+  opts?: { reference?: string; quiet?: boolean }
+): Promise<OrderTransactionRow[]> {
+  const reference = opts?.reference?.trim();
+  const sql = reference
+    ? `SELECT * FROM public.order_transaction WHERE order_id = $1 AND reference = $2 ORDER BY created_at DESC`
+    : `SELECT * FROM public.order_transaction WHERE order_id = $1 ORDER BY created_at DESC`;
+
+  if (!opts?.quiet) {
+    const shown = reference
+      ? sql.replace('$1', `'${orderId}'`).replace('$2', `'${reference}'`)
+      : sql.replace('$1', `'${orderId}'`);
+    logDbStep('6/7', 'Query order_transaction', shown);
+  }
+
+  const client = await connectToDatabase(!opts?.quiet);
+  try {
+    const result = reference
+      ? await client.query(sql, [orderId, reference])
+      : await client.query(sql, [orderId]);
+    if (!opts?.quiet) {
+      logDbStep('6/7', `order_transaction: ${result.rows.length} row(s)`);
+    }
+    return result.rows as OrderTransactionRow[];
+  } finally {
+    await client.end();
+  }
+}
+
+export function logOrderTransactions(
+  label: string,
+  rows: OrderTransactionRow[]
+): void {
+  console.log(`\n  ${label}`);
+  if (rows.length === 0) {
+    console.log('  (no rows)');
+    return;
+  }
+  console.log('  ┌────┬──────────────────────────────┬────────────┬─────────────────────────┐');
+  console.log('  │ #  │ id                           │ reference  │ created_at              │');
+  rows.forEach((r, i) => {
+    const id = String(r.id ?? '').slice(0, 28).padEnd(28);
+    const ref = String(r.reference ?? '').padEnd(10);
+    const created = String(r.created_at ?? '').slice(0, 23);
+    console.log(`  │ ${String(i + 1).padStart(2)} │ ${id} │ ${ref} │ ${created} │`);
+  });
+  console.log('  └────┴──────────────────────────────┴────────────┴─────────────────────────┘');
+}
+
+/**
+ * Poll until a capture (or configured) order_transaction exists for this Medusa order id.
+ */
+export async function waitForOrderTransactionReference(
+  orderId: string,
+  opts?: {
+    reference?: string;
+    initialWaitMs?: number;
+    pollTimeoutMs?: number;
+    intervalMs?: number;
+    waitEnvLabel?: string;
+  }
+): Promise<OrderTransactionRow> {
+  const reference = opts?.reference ?? ORDER_TRANSACTION_REFERENCE;
+  const initialWaitMs = opts?.initialWaitMs ?? SYNC_PAYMENT_WAIT_MS;
+  const pollTimeoutMs = opts?.pollTimeoutMs ?? SYNC_PAYMENT_POLL_TIMEOUT_MS;
+  const intervalMs = opts?.intervalMs ?? SYNC_PAYMENT_POLL_INTERVAL_MS;
+  const waitLabel = opts?.waitEnvLabel ?? 'SYNC_PAYMENT_WAIT_MS';
+
+  console.log('\n────────── Wait for payment in order_transaction ──────────');
+  logDbStep(
+    '5/7',
+    `Initial wait ${Math.round(initialWaitMs / 1000)}s (${waitLabel})`,
+    'payment sync after Odoo Create Payment'
+  );
+  await new Promise((r) => setTimeout(r, initialWaitMs));
+
+  logDbStep(
+    '7/7',
+    `Polling every ${intervalMs / 1000}s for up to ${Math.round(pollTimeoutMs / 1000)}s`,
+    `order_id=${orderId}  reference=${reference}`
+  );
+
+  const deadline = Date.now() + pollTimeoutMs;
+  let attempt = 0;
+  while (Date.now() < deadline) {
+    attempt += 1;
+    const rows = await findOrderTransactionsByOrderId(orderId, {
+      reference,
+      quiet: true,
+    });
+    console.log(`         poll #${attempt}: ${rows.length} row(s) with reference=${reference}`);
+    if (rows.length > 0) {
+      const row = rows[0];
+      logDbStep(
+        '7/7',
+        'Payment transaction found',
+        `id=${row.id}  reference=${row.reference}`
+      );
+      return row;
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+
+  const all = await findOrderTransactionsByOrderId(orderId, { quiet: true });
+  logOrderTransactions('All transactions for order (any reference):', all);
+  throw new Error(
+    `No order_transaction with order_id="${orderId}" and reference="${reference}" after ` +
+      `${Math.round(initialWaitMs / 1000)}s wait + ${Math.round(pollTimeoutMs / 1000)}s polling.`
+  );
+}
+
+/**
+ * Assert payment synced: order_transaction.reference === capture (configurable).
+ */
+export async function verifyOrderPaymentSyncedInDb(
+  orderId: string,
+  opts?: { reference?: string }
+): Promise<{
+  orderId: string;
+  transaction: OrderTransactionRow;
+  reference: string;
+}> {
+  const expectedRef = opts?.reference ?? ORDER_TRANSACTION_REFERENCE;
+  const transaction = await waitForOrderTransactionReference(orderId, {
+    reference: expectedRef,
+  });
+
+  const actualRef = String(transaction.reference ?? '').trim();
+  if (actualRef !== expectedRef) {
+    throw new Error(
+      `order_transaction.reference expected "${expectedRef}", got "${actualRef}"`
+    );
+  }
+
+  console.log('\n────────── Payment sync assertion ──────────');
+  console.log(`  order_id   : ${orderId}`);
+  console.log(`  transaction: ${transaction.id}`);
+  console.log(`  reference  : ${actualRef}  ← expected "${expectedRef}"`);
+  console.log(`  Match      : YES ✓`);
+
+  return { orderId, transaction, reference: actualRef };
 }

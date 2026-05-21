@@ -48,6 +48,10 @@ import {
   ODOO_TEST_CUSTOMER_SEARCH,
 
   buildOdooTestOrderLines,
+  buildOdooDeliveryPickQuantityUpdates,
+  updateAndValidateOdooDeliveryTransfers,
+  parseOdooDeliveryTransferRefs,
+  payOdooSalesOrderInvoice,
 
 } from './sync.helpers';
 
@@ -60,6 +64,12 @@ import {
   completeOrderUpdateInDb,
 
   logDbLines,
+
+  getMedusaOrderIdFromOrderRow,
+
+  verifyOrderPaymentSyncedInDb,
+
+  logOrderTransactions,
 
 } from './db.helpers';
 
@@ -410,12 +420,14 @@ test.describe('Debug — Odoo create + DB verify', () => {
       displayId: displayIdAfterUpdate,
       dbTotal,
       dbLines,
+      dbRow: dbRowAfterUpdate,
     } = await completeOrderUpdateInDb(
       odooId,
       odooLinesUpdated,
       odooUntaxed,
       odooTotalInclTax
     );
+    const medusaOrderId = getMedusaOrderIdFromOrderRow(dbRowAfterUpdate);
 
     logFlowStep('Order re-verified in database', {
       odoo_id: odooId,
@@ -424,17 +436,101 @@ test.describe('Debug — Odoo create + DB verify', () => {
     });
     logDbLines('DB line items after update:', dbLines);
 
+    logFlowHeader('PHASE 4 — WH/PICK → Validate → Next Transfer → WH/OUT → Validate');
+    const pickQtyUpdates = buildOdooDeliveryPickQuantityUpdates();
+    const transferRefs = parseOdooDeliveryTransferRefs();
+    logFlowStep('Update done qty and validate each transfer', {
+      transfers: transferRefs,
+      lines: pickQtyUpdates,
+    });
+
+    const transferResults = await updateAndValidateOdooDeliveryTransfers(
+      page,
+      pickQtyUpdates,
+      { odooId }
+    );
+
+    logFlowHeader('PHASE 5 — Invoices → Pay → Create Payment');
+    logFlowStep('Register payment on sales order invoice', { odoo_id: odooId });
+    await payOdooSalesOrderInvoice(page, odooId);
+
+    logFlowHeader('PHASE 6 — DB: order_transaction payment sync');
+    logFlowStep('Verify order_transaction.reference = capture', {
+      order_id: medusaOrderId,
+    });
+    const { transaction: paymentTx } = await verifyOrderPaymentSyncedInDb(
+      medusaOrderId
+    );
+    logOrderTransactions('order_transaction rows (capture):', [paymentTx]);
+
     logFlowSummary([
       `Odoo order: ${odooOrderName} (id ${odooId})`,
       `Medusa display_id: ${displayId}`,
       `After update: ${odooTotalInclTax} SAR incl. VAT — MATCH (DB ${dbTotal})`,
       `Qty: ${qtyUpdates.map((u) => u.quantity).join(', ')}`,
       `Lines: ${odooLinesUpdated.length} item(s) matched`,
-      'Create + update + re-verify PASSED',
+      `Transfers: ${transferResults.map((r) => r.transferName).join(' → ')}`,
+      `Pick done qty: ${pickQtyUpdates.map((u) => u.quantity).join(', ')}`,
+      'Invoice: Pay → Create Payment',
+      `Payment DB: order_transaction.reference=${paymentTx.reference}`,
+      `Medusa order_id: ${medusaOrderId}`,
+      'Full cycle PASSED',
     ]);
 
     logFlowStep('Pause in Playwright Inspector — press F8 to finish');
     await page.pause();
+  });
+
+  test('DEBUG-INVOICE-PAY | Order → Invoices → Pay → Create Payment', async ({
+    page,
+  }) => {
+    test.setTimeout(120_000);
+    const odooId = process.env.ODOO_INSPECT_ORDER_ID?.trim();
+    if (!odooId) {
+      throw new Error('Set ODOO_INSPECT_ORDER_ID in .env (numeric sales order id)');
+    }
+
+    resetFlowSteps();
+    logFlowHeader('INVOICE PAYMENT');
+    await loginOdoo(page);
+    logFlowStep('Pay invoice via Create Payment', { odoo_id: odooId });
+    await payOdooSalesOrderInvoice(page, odooId);
+    logFlowSummary([`Order id ${odooId}`, 'Invoices → Pay → Create Payment PASSED']);
+  });
+
+  test('DEBUG-DELIVERY-PICKS | Open pick → update done qty per line → Validate', async ({
+    page,
+  }) => {
+    test.setTimeout(180_000);
+    const odooId = process.env.ODOO_INSPECT_ORDER_ID?.trim();
+    if (!odooId) {
+      throw new Error(
+        'Set ODOO_INSPECT_ORDER_ID in .env to a confirmed sales order id (numeric)'
+      );
+    }
+
+    resetFlowSteps();
+    logFlowHeader('DELIVERY PICK — update qty → Validate');
+    await loginOdoo(page);
+
+    const pickQtyUpdates = buildOdooDeliveryPickQuantityUpdates();
+    logFlowStep('Open order and update pick done quantities', {
+      odoo_id: odooId,
+      lines: pickQtyUpdates,
+    });
+
+    const transferResults = await updateAndValidateOdooDeliveryTransfers(
+      page,
+      pickQtyUpdates,
+      { odooId }
+    );
+
+    logFlowSummary([
+      `Order id ${odooId}`,
+      `Transfers: ${transferResults.map((r) => r.transferName).join(' → ')}`,
+      `Pick qty: ${pickQtyUpdates.map((u) => u.quantity).join(', ')}`,
+      'WH/PICK + WH/OUT update + validate PASSED',
+    ]);
   });
 
 });

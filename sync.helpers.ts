@@ -1137,6 +1137,629 @@ export async function getMedusaCustomerEmail(page: Page): Promise<string> {
   ).trim();
 }
 
+// ─── Odoo: Delivery picks (stock picking / transfers) ─────────────────────────
+
+export interface OdooDeliveryPickLine {
+  product: string;
+  demand: number;
+  quantity: number;
+}
+
+export interface OdooDeliveryPickQuantityUpdate {
+  product: string;
+  quantity: number;
+}
+
+/** Done-qty targets on delivery pick lines — defaults to post-SO update qty (3, 0.5, 12.36). */
+export function buildOdooDeliveryPickQuantityUpdates(): OdooDeliveryPickQuantityUpdate[] {
+  return buildPostCreateQuantityUpdates().map((u) => ({
+    product: u.product,
+    quantity: u.quantity,
+  }));
+}
+
+/** Only transfers in Waiting status (skips Done / Cancelled). */
+function isWaitingTransferRow(text: string): boolean {
+  return /\bwaiting\b/i.test(text);
+}
+
+/** Transfers to update + validate (default: WH/PICK then WH/OUT, Waiting only). */
+export function parseOdooDeliveryTransferRefs(): string[] {
+  const raw = process.env.ODOO_DELIVERY_TRANSFER_TYPES?.trim();
+  if (raw) {
+    return raw
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+  return ['WH/PICK', 'WH/OUT'];
+}
+
+/** Transfer list rows only (reference contains WH/). */
+function deliveryTransferListRows(page: Page) {
+  return page
+    .locator('.o_list_view tbody tr.o_data_row, .o_list_table tbody tr.o_data_row')
+    .filter({ hasText: /WH\// });
+}
+
+async function waitForDeliveryTransferList(page: Page): Promise<void> {
+  await expect
+    .poll(async () => deliveryTransferListRows(page).count(), {
+      timeout: 60_000,
+      intervals: [300, 500, 1000],
+    })
+    .toBeGreaterThan(0);
+}
+
+/** Breadcrumb only — never goto action URL (loads all warehouse transfers). */
+async function returnToOdooDeliveryTransferList(page: Page): Promise<void> {
+  const transfersLink = page.getByRole('link', { name: /^transfers$/i });
+  if (await transfersLink.isVisible().catch(() => false)) {
+    console.log('         → Back to transfers list (breadcrumb)');
+    await transfersLink.click();
+    await waitForOdooToolbarReady(page);
+    await waitForDeliveryTransferList(page);
+    return;
+  }
+  throw new Error(
+    'Cannot return to order transfers list — use Delivery on the sales order again'
+  );
+}
+
+/** Odoo chain: PICK → … → OUT via toolbar button after validating PICK. */
+export async function goToNextOdooDeliveryTransfer(page: Page): Promise<string> {
+  await waitForOdooToolbarReady(page);
+
+  const prevName = await readCurrentTransferRef(page);
+  const nextBtn = page.locator('button[name="action_next_transfer"]').first();
+  await nextBtn.waitFor({ state: 'visible', timeout: 30_000 });
+  await expect(nextBtn).toBeEnabled({ timeout: 60_000 });
+
+  console.log(`         → Next Transfer (from ${prevName})`);
+  await nextBtn.click();
+  await waitForOdooToolbarReady(page);
+  await dismissOdooConfirmDialog(page);
+
+  await expect
+    .poll(async () => readCurrentTransferRef(page), { timeout: 60_000 })
+    .not.toBe(prevName);
+
+  await ensureOdooDeliveryPickOperationsVisible(page);
+  await expect(deliveryMoveDataRows(page).first()).toBeVisible({
+    timeout: 30_000,
+  });
+
+  const name = await readCurrentTransferRef(page);
+  console.log(`         ✓ Next transfer open: ${name}`);
+  return name;
+}
+
+async function readCurrentTransferRef(page: Page): Promise<string> {
+  const ref = await page
+    .locator('.o_breadcrumb .active, h1')
+    .first()
+    .innerText()
+    .catch(() => '');
+  return ref.replace(/\s+/g, ' ').trim() || page.url();
+}
+
+export async function openOdooSalesOrderById(
+  page: Page,
+  odooId: string
+): Promise<void> {
+  const orderUrl = `${ODOO_URL}/sales/${odooId}`;
+  console.log(`         → Open sales order: ${orderUrl}`);
+  await page.goto(orderUrl, { waitUntil: 'domcontentloaded' });
+  await waitForOdooToolbarReady(page);
+  await dismissOdooDialog(page);
+  await waitForOdooSalesOrderComplete(page);
+}
+
+function deliveryMoveDataRows(page: Page) {
+  return page.locator(
+    '.o_field_one2many[name="move_ids_without_package"] tbody tr.o_data_row'
+  );
+}
+
+function deliveryMoveQtyInput(row: Locator): Locator {
+  return row.locator('[name="quantity"] input').first();
+}
+
+function deliveryMoveQtyCell(row: Locator): Locator {
+  return row.locator('td[name="quantity"], [name="quantity"]').first();
+}
+
+async function ensureOdooDeliveryPickOperationsVisible(page: Page): Promise<void> {
+  await waitForOdooToolbarReady(page);
+
+  const opsTab = page.getByRole('tab', { name: 'Operations' });
+  if (await opsTab.isVisible().catch(() => false)) {
+    await opsTab.click();
+    await waitForOdooToolbarReady(page);
+  }
+}
+
+function transferRefPattern(transferRef: string): RegExp {
+  const escaped = transferRef.replace(/[/]/g, '\\/');
+  return new RegExp(escaped);
+}
+
+async function findDeliveryTransferRow(
+  page: Page,
+  transferRef: string,
+  orderName?: string
+): Promise<Locator> {
+  let rows = deliveryTransferListRows(page);
+  const n = await rows.count();
+  if (n > 15) {
+    throw new Error(
+      `Transfers list has ${n} rows (expected ≤15 for this order). ` +
+        'Re-open Delivery from the sales order — do not reload the action URL.'
+    );
+  }
+
+  const pattern = transferRefPattern(transferRef);
+  const statuses: string[] = [];
+
+  for (let i = 0; i < n; i++) {
+    const row = rows.nth(i);
+    const text = (await row.innerText()).replace(/\s+/g, ' ');
+    if (!pattern.test(text)) continue;
+    if (orderName && !text.includes(orderName)) continue;
+
+    const status = text.match(
+      /\b(Waiting|Done|Cancelled|Ready|Draft)\b/i
+    )?.[1];
+    statuses.push(`${transferRef} row ${i + 1}: ${status ?? 'unknown'}`);
+
+    if (!isWaitingTransferRow(text)) continue;
+
+    console.log(
+      `         → Waiting ${transferRef}: ${text.match(/WH\/[^\s|]+/)?.[0] ?? text.slice(0, 40)}`
+    );
+    return row;
+  }
+
+  throw new Error(
+    `No Waiting "${transferRef}" for this order (${n} row(s)). ` +
+      `Seen: ${statuses.join('; ') || 'none'}`
+  );
+}
+
+async function readDeliveryMoveFromRow(
+  row: Locator
+): Promise<OdooDeliveryPickLine | null> {
+  const product =
+    (await row
+      .locator('[name="product_id"]')
+      .first()
+      .innerText()
+      .catch(() => '')) || '';
+  if (!product.trim()) return null;
+
+  const demandInp = row.locator('[name="product_uom_qty"] input');
+  let demand = 0;
+  if ((await demandInp.count()) > 0) {
+    demand = parseFloat((await demandInp.inputValue()) || '0') || 0;
+  } else {
+    const t = await row
+      .locator('[name="product_uom_qty"]')
+      .first()
+      .innerText()
+      .catch(() => '0');
+    demand = parseFloat(t.replace(/[^\d.]/g, '')) || 0;
+  }
+
+  const qtyInp = deliveryMoveQtyInput(row);
+  let quantity = 0;
+  if (await qtyInp.isVisible().catch(() => false)) {
+    quantity = parseFloat((await qtyInp.inputValue()) || '0') || 0;
+  } else {
+    const t = await deliveryMoveQtyCell(row).innerText().catch(() => '0');
+    quantity = parseFloat(t.replace(/[^\d.]/g, '')) || 0;
+  }
+
+  return { product: product.trim(), demand, quantity };
+}
+
+function deliveryRowMatchesProduct(rowProduct: string, target: string): boolean {
+  const a = rowProduct.toLowerCase();
+  const b = target.toLowerCase();
+  if (a.includes(b) || b.includes(a)) return true;
+  const short = b.slice(0, Math.min(24, b.length));
+  return short.length >= 8 && a.includes(short);
+}
+
+async function setDeliveryMoveQuantityInRow(
+  page: Page,
+  row: Locator,
+  quantity: number
+): Promise<void> {
+  await row.scrollIntoViewIfNeeded();
+
+  let textbox = deliveryMoveQtyInput(row);
+  if (!(await textbox.isVisible().catch(() => false))) {
+    await deliveryMoveQtyCell(row).click({ timeout: 10_000 });
+    textbox = deliveryMoveQtyInput(row);
+  }
+  if (!(await textbox.isVisible().catch(() => false))) {
+    await row.dblclick();
+    await page.waitForTimeout(400);
+    textbox = deliveryMoveQtyInput(row);
+  }
+
+  await expect(textbox).toBeVisible({ timeout: 10_000 });
+  await textbox.click();
+  await textbox.press('Control+a');
+  await textbox.fill(String(quantity));
+  await textbox.press('Tab');
+  await page.waitForTimeout(400);
+}
+
+/** Sales order → Delivery → order-scoped transfers list (do not reload action URL). */
+export async function openOdooDeliveryTransferList(
+  page: Page,
+  odooId: string
+): Promise<string> {
+  await openOdooSalesOrderById(page, odooId);
+
+  const orderName = await page
+    .locator('.o_breadcrumb .active, h1')
+    .first()
+    .innerText()
+    .catch(() => '');
+  const orderLabel = orderName.replace(/\s+/g, ' ').trim();
+
+  console.log('         → Delivery: open transfers list');
+  const deliveryBtn = page.locator('button[name="action_view_delivery"]').first();
+  await deliveryBtn.waitFor({ state: 'visible', timeout: 30_000 });
+  await deliveryBtn.click();
+  await waitForOdooToolbarReady(page);
+  await page.waitForURL(/\/sales\/\d+\/action-\d+/, { timeout: 60_000 });
+
+  if ((await deliveryTransferListRows(page).count()) === 0) {
+    await returnToOdooDeliveryTransferList(page).catch(() => {});
+  }
+
+  await waitForDeliveryTransferList(page);
+  const count = await deliveryTransferListRows(page).count();
+  if (count > 15) {
+    throw new Error(
+      `Transfers list has ${count} rows — expected only this order's deliveries`
+    );
+  }
+  console.log(
+    `         ✓ Order transfers list (${count} row(s))${orderLabel ? ` — ${orderLabel}` : ''}`
+  );
+  return orderLabel;
+}
+
+/**
+ * Open one transfer from the list (e.g. WH/PICK or WH/OUT).
+ * Returns full reference (e.g. WH/PICK/48242).
+ */
+export async function openOdooDeliveryTransferByRef(
+  page: Page,
+  transferRef: string,
+  opts?: { orderName?: string; alreadyOnList?: boolean }
+): Promise<string> {
+  if (!opts?.alreadyOnList) {
+    await returnToOdooDeliveryTransferList(page);
+  } else {
+    await waitForDeliveryTransferList(page);
+  }
+
+  const row = await findDeliveryTransferRow(
+    page,
+    transferRef,
+    opts?.orderName
+  );
+  const rowText = (await row.innerText()).replace(/\s+/g, ' ').trim().slice(0, 80);
+  console.log(`         → Open transfer ${transferRef} — ${rowText}`);
+
+  await row.dblclick();
+  await waitForOdooToolbarReady(page);
+  await page
+    .waitForURL(/\/action-\d+\/\d+/, { timeout: 60_000 })
+    .catch(() => {});
+
+  await ensureOdooDeliveryPickOperationsVisible(page);
+  await expect(deliveryMoveDataRows(page).first()).toBeVisible({
+    timeout: 30_000,
+  });
+
+  const name = await readCurrentTransferRef(page);
+  const pattern = transferRefPattern(transferRef);
+  if (!pattern.test(name)) {
+    throw new Error(
+      `Expected transfer ${transferRef}, but form shows: ${name}`
+    );
+  }
+  console.log(`         ✓ Transfer open: ${name}`);
+  return name;
+}
+
+/**
+ * Sales order → Delivery → open one transfer (by ref or list index).
+ * @deprecated Prefer openOdooDeliveryTransferList + openOdooDeliveryTransferByRef
+ */
+export async function openOdooDeliveryPickFromSalesOrder(
+  page: Page,
+  opts?: { odooId?: string; pickIndex?: number; transferRef?: string }
+): Promise<string> {
+  const odooId =
+    opts?.odooId?.trim() || page.url().match(/\/sales\/(\d+)/)?.[1] || '';
+  if (!odooId) {
+    throw new Error('openOdooDeliveryPickFromSalesOrder: odooId required');
+  }
+
+  const orderName = await openOdooDeliveryTransferList(page, odooId);
+
+  if (opts?.transferRef) {
+    return openOdooDeliveryTransferByRef(page, opts.transferRef, {
+      orderName,
+      alreadyOnList: true,
+    });
+  }
+
+  const pickIndex = opts?.pickIndex ?? 0;
+  const row = deliveryTransferListRows(page).nth(pickIndex);
+  await row.dblclick();
+  await waitForOdooToolbarReady(page);
+  await ensureOdooDeliveryPickOperationsVisible(page);
+  return readCurrentTransferRef(page);
+}
+
+/** Read Operations lines on the open delivery pick form. */
+export async function getOdooDeliveryPickLines(
+  page: Page
+): Promise<OdooDeliveryPickLine[]> {
+  await ensureOdooDeliveryPickOperationsVisible(page);
+  const lines: OdooDeliveryPickLine[] = [];
+  const rows = deliveryMoveDataRows(page);
+  const n = await rows.count();
+  for (let i = 0; i < n; i++) {
+    const line = await readDeliveryMoveFromRow(rows.nth(i));
+    if (line) lines.push(line);
+  }
+  return lines;
+}
+
+export function logOdooDeliveryPickLines(
+  label: string,
+  lines: OdooDeliveryPickLine[]
+): void {
+  console.log(`\n  ${label}`);
+  console.log('  ┌────┬────────────────────────────────────────────┬──────────┬──────────┐');
+  console.log('  │ #  │ Product                                    │ Demand   │ Done     │');
+  for (let i = 0; i < lines.length; i++) {
+    const p = lines[i].product.length > 42 ? `${lines[i].product.slice(0, 39)}...` : lines[i].product;
+    const d = String(lines[i].demand).padStart(8);
+    const q = String(lines[i].quantity).padStart(8);
+    console.log(`  │ ${String(i + 1).padStart(2)} │ ${p.padEnd(42)} │ ${d} │ ${q} │`);
+  }
+  console.log('  └────┴────────────────────────────────────────────┴──────────┴──────────┘');
+}
+
+/** Set done qty on each Operations line on the currently open transfer form. */
+export async function setOdooDeliveryPickLineQuantitiesOnForm(
+  page: Page,
+  updates: OdooDeliveryPickQuantityUpdate[]
+): Promise<OdooDeliveryPickLine[]> {
+  await ensureOdooDeliveryPickOperationsVisible(page);
+
+  const rows = deliveryMoveDataRows(page);
+  await expect(rows.first()).toBeVisible({ timeout: 15_000 });
+  const rowCount = await rows.count();
+
+  for (let u = 0; u < updates.length; u++) {
+    const update = updates[u];
+    let matched = false;
+    for (let i = 0; i < rowCount; i++) {
+      const row = rows.nth(i);
+      const line = await readDeliveryMoveFromRow(row);
+      if (!line || !deliveryRowMatchesProduct(line.product, update.product)) {
+        continue;
+      }
+      console.log(
+        `         → Line ${i + 1}/${rowCount}: ${update.product} → done qty ${update.quantity}`
+      );
+      await setDeliveryMoveQuantityInRow(page, row, update.quantity);
+      matched = true;
+      break;
+    }
+    if (!matched) {
+      throw new Error(
+        `Delivery pick line not found for product: ${update.product}`
+      );
+    }
+  }
+
+  const saveBtn = page.getByRole('button', { name: 'Save manually' });
+  if (await saveBtn.isVisible().catch(() => false)) {
+    console.log('         → Save transfer');
+    await saveBtn.click();
+    await waitForOdooToolbarReady(page);
+  }
+
+  const lines = await getOdooDeliveryPickLines(page);
+  console.log('         ✓ Transfer quantities updated');
+  return lines;
+}
+
+/**
+ * Open delivery pick → set done quantity on each Operations line → save.
+ * Single transfer only; use updateAndValidateOdooDeliveryTransfers for WH/PICK + WH/OUT.
+ */
+export async function updateOdooDeliveryPickLineQuantities(
+  page: Page,
+  updates: OdooDeliveryPickQuantityUpdate[],
+  opts?: { odooId?: string; pickIndex?: number; transferRef?: string }
+): Promise<OdooDeliveryPickLine[]> {
+  const odooId =
+    opts?.odooId?.trim() || page.url().match(/\/sales\/(\d+)/)?.[1] || '';
+  if (!odooId) {
+    throw new Error('updateOdooDeliveryPickLineQuantities: odooId required');
+  }
+
+  const orderName = await openOdooDeliveryTransferList(page, odooId);
+  if (opts?.transferRef) {
+    await openOdooDeliveryTransferByRef(page, opts.transferRef, {
+      orderName,
+      alreadyOnList: true,
+    });
+  } else {
+    await deliveryTransferListRows(page)
+      .nth(opts?.pickIndex ?? 0)
+      .dblclick();
+    await waitForOdooToolbarReady(page);
+    await ensureOdooDeliveryPickOperationsVisible(page);
+  }
+
+  return setOdooDeliveryPickLineQuantitiesOnForm(page, updates);
+}
+
+export type OdooDeliveryTransferResult = {
+  transferRef: string;
+  transferName: string;
+  lines: OdooDeliveryPickLine[];
+};
+
+/**
+ * WH/PICK (Waiting) → qty → Validate → Next Transfer → WH/OUT → qty → Validate.
+ */
+export async function updateAndValidateOdooDeliveryTransfers(
+  page: Page,
+  updates: OdooDeliveryPickQuantityUpdate[],
+  opts: { odooId: string; transferRefs?: string[] }
+): Promise<OdooDeliveryTransferResult[]> {
+  const refs = opts.transferRefs ?? parseOdooDeliveryTransferRefs();
+  const pickRef = refs[0] ?? 'WH/PICK';
+  const outRef = refs[1] ?? 'WH/OUT';
+  const results: OdooDeliveryTransferResult[] = [];
+
+  const orderName = await openOdooDeliveryTransferList(page, opts.odooId);
+
+  console.log(`\n         ═══ ${pickRef} (Waiting) ═══`);
+  const pickName = await openOdooDeliveryTransferByRef(page, pickRef, {
+    orderName,
+    alreadyOnList: true,
+  });
+  let lines = await setOdooDeliveryPickLineQuantitiesOnForm(page, updates);
+  logOdooDeliveryPickLines(`Lines after update (${pickRef}):`, lines);
+  await validateOdooDeliveryPick(page);
+  results.push({ transferRef: pickRef, transferName: pickName, lines });
+
+  const nextTransferWaitMs = Number(
+    process.env.ODOO_NEXT_TRANSFER_WAIT_MS ?? 10_000
+  );
+  console.log(
+    `         → Wait ${nextTransferWaitMs / 1000}s after PICK validate, then Next Transfer`
+  );
+  await page.waitForTimeout(nextTransferWaitMs);
+
+  console.log(`\n         ═══ ${outRef} (Next Transfer) ═══`);
+  const outName = await goToNextOdooDeliveryTransfer(page);
+  const outPattern = transferRefPattern(outRef);
+  if (!outPattern.test(outName)) {
+    throw new Error(
+      `Next Transfer opened "${outName}" — expected ${outRef}`
+    );
+  }
+
+  lines = await setOdooDeliveryPickLineQuantitiesOnForm(page, updates);
+  logOdooDeliveryPickLines(`Lines after update (${outRef}):`, lines);
+  await validateOdooDeliveryPick(page);
+  results.push({ transferRef: outRef, transferName: outName, lines });
+
+  console.log(
+    `         ✓ PICK → OUT done: ${results.map((r) => r.transferName).join(' → ')}`
+  );
+  return results;
+}
+
+/** Validate transfer only (does not click Check Availability). */
+export async function validateOdooDeliveryPick(page: Page): Promise<void> {
+  await waitForOdooToolbarReady(page);
+  await ensureOdooDeliveryPickOperationsVisible(page);
+
+  const validateBtn = page
+    .locator('button[name="button_validate"]')
+    .or(page.getByRole('button', { name: /^validate$/i }))
+    .first();
+
+  if (!(await validateBtn.isVisible().catch(() => false))) {
+    console.log('         ✓ Transfer already validated (no Validate button)');
+    return;
+  }
+
+  console.log('         → Validate');
+  await expect(validateBtn).toBeEnabled({ timeout: 90_000 });
+  await validateBtn.click();
+  await waitForOdooToolbarReady(page);
+  await dismissOdooConfirmDialog(page);
+
+  const applyImmediate = page.getByRole('button', { name: /^apply$/i });
+  if (await applyImmediate.isVisible().catch(() => false)) {
+    console.log('         → Apply immediate transfer');
+    await applyImmediate.click();
+    await waitForOdooToolbarReady(page);
+    await dismissOdooConfirmDialog(page);
+  }
+
+  console.log('         ✓ Delivery pick validated');
+}
+
+// ─── Odoo: Invoice payment ────────────────────────────────────────────────────
+
+function odooPayInvoiceDialog(page: Page) {
+  return page.locator('.modal-dialog').filter({ hasText: /^pay/i }).last();
+}
+
+/**
+ * Sales order → Invoices → Pay → Create Payment (register payment wizard).
+ */
+export async function payOdooSalesOrderInvoice(
+  page: Page,
+  odooId: string
+): Promise<void> {
+  await openOdooSalesOrderById(page, odooId);
+
+  console.log('         → Invoices');
+  const invoicesBtn = page.locator('button[name="action_view_invoice"]').first();
+  await invoicesBtn.waitFor({ state: 'visible', timeout: 30_000 });
+  await invoicesBtn.click();
+  await waitForOdooToolbarReady(page);
+  await page
+    .waitForURL(/\/invoicing\/|\/invoice\/|\/account\//, { timeout: 60_000 })
+    .catch(() => {});
+
+  const payBtn = page.getByRole('button', { name: /^pay$/i }).first();
+  await payBtn.waitFor({ state: 'visible', timeout: 30_000 });
+  await expect(payBtn).toBeEnabled({ timeout: 60_000 });
+
+  console.log('         → Pay');
+  await payBtn.click();
+  await waitForOdooToolbarReady(page);
+
+  const payDialog = odooPayInvoiceDialog(page);
+  await payDialog.waitFor({ state: 'visible', timeout: 30_000 });
+
+  const createPaymentBtn = payDialog
+    .locator('button[name="action_create_payments"]')
+    .or(payDialog.getByRole('button', { name: /create payment/i }))
+    .first();
+
+  console.log('         → Create Payment');
+  await createPaymentBtn.waitFor({ state: 'visible', timeout: 30_000 });
+  await expect(createPaymentBtn).toBeEnabled({ timeout: 60_000 });
+  await createPaymentBtn.click();
+  await waitForOdooToolbarReady(page);
+  await dismissOdooConfirmDialog(page);
+
+  console.log('         ✓ Invoice payment created (Create Payment)');
+}
+
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
 export function parseCurrency(text: string): number {

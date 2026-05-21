@@ -8,6 +8,8 @@
     "test:step1": "playwright test create-update-order-from-odoo.ts -g DEBUG-CREATE",
     "test:step1:update": "playwright test create-update-order-from-odoo.ts -g DEBUG-UPDATE-QTY",
     "test:step1:full": "playwright test create-update-order-from-odoo.ts -g DEBUG-UPDATE-QTY",
+    "test:step1:delivery-picks": "playwright test create-update-order-from-odoo.ts -g DEBUG-DELIVERY-PICKS",
+    "test:step1:invoice-pay": "playwright test create-update-order-from-odoo.ts -g DEBUG-INVOICE-PAY",
     "test:step1:debug": "playwright test create-update-order-from-odoo.ts -g DEBUG-INSPECT",
     "test:step1:inspect-products": "playwright test create-update-order-from-odoo.ts -g DEBUG-INSPECT",
     "test:step1:login": "playwright test create-update-order-from-odoo.ts -g DEBUG-LOGIN",
@@ -21,7 +23,8 @@
     "db:proxy": "start-cloud-sql-proxy.bat",
     "db:ping": "node scripts/db-ping.js",
     "db:query": "node scripts/db-query.js",
-    "db:recent": "node scripts/db-recent-odoo-orders.js"
+    "db:recent": "node scripts/db-recent-odoo-orders.js",
+    "db:transactions": "node scripts/db-order-transactions.js"
   },
   "dependencies": {
     "dotenv": "^16.6.1",

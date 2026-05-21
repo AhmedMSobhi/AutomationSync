@@ -4,7 +4,11 @@ dotenv.config();
 
 export default defineConfig({
   testDir: '.',
-  testMatch: [/.*\.spec\.ts$/, /create-update-order-from-odoo\.ts$/],
+  testMatch: [
+    /.*\.spec\.ts$/,
+    /create-update-order-from-odoo\.ts$/,
+    /scripts\/probe-.*\.ts$/,
+  ],
   timeout:  360_000,   // full cycle: Odoo UI + 1 min sync wait + DB poll
   retries:  1,
   workers:  1,        // MUST be serial — sync tests depend on order
