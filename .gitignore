@@ -1,0 +1,6 @@
+.env
+node_modules/
+test-results/
+playwright-report/
+tools/platraw-key.json
+*.auth-state.json

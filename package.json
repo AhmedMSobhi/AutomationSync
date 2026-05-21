@@ -1,0 +1,36 @@
+{
+  "name": "odoo-to-medusa-sync-tests",
+  "version": "1.0.0",
+  "description": "Playwright UI automation: Odoo order creation → manual sync → Medusa Admin verification",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "test:step1": "playwright test create-update-order-from-odoo.ts -g DEBUG-CREATE",
+    "test:step1:update": "playwright test create-update-order-from-odoo.ts -g DEBUG-UPDATE-QTY",
+    "test:step1:full": "playwright test create-update-order-from-odoo.ts -g DEBUG-UPDATE-QTY",
+    "test:step1:debug": "playwright test create-update-order-from-odoo.ts -g DEBUG-INSPECT",
+    "test:step1:inspect-products": "playwright test create-update-order-from-odoo.ts -g DEBUG-INSPECT",
+    "test:step1:login": "playwright test create-update-order-from-odoo.ts -g DEBUG-LOGIN",
+    "test:medusa-login": "playwright test create-update-order-from-odoo.ts -g DEBUG-MEDUSA-LOGIN",
+    "test:suite1": "playwright test tests/01-order-appears-in-medusa.spec.ts",
+    "test:suite2": "playwright test tests/02-fields-match.spec.ts",
+    "test:suite3": "playwright test tests/03-status-sync.spec.ts",
+    "test:suite4": "playwright test tests/04-edge-cases.spec.ts",
+    "test:codegen": "playwright codegen",
+    "report": "playwright show-report",
+    "db:proxy": "start-cloud-sql-proxy.bat",
+    "db:ping": "node scripts/db-ping.js",
+    "db:query": "node scripts/db-query.js",
+    "db:recent": "node scripts/db-recent-odoo-orders.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.6.1",
+    "pg": "^8.21.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.60.0",
+    "@types/pg": "^8.20.0",
+    "playwright": "^1.60.0",
+    "typescript": "^5.4.5"
+  }
+}
