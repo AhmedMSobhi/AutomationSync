@@ -24,6 +24,20 @@ export const SYNC_PAYMENT_POLL_INTERVAL_MS = Number(
 /** Expected order_transaction.reference when payment syncs (default: capture). */
 export const ORDER_TRANSACTION_REFERENCE =
   process.env.ORDER_TRANSACTION_REFERENCE?.trim() || 'capture';
+/** Wait after WH/OUT validate before order_fulfillment query (default 30s). */
+export const SYNC_FULFILLMENT_WAIT_MS = Number(
+  process.env.SYNC_FULFILLMENT_WAIT_MS ?? 30_000
+);
+export const SYNC_FULFILLMENT_POLL_TIMEOUT_MS = Number(
+  process.env.SYNC_FULFILLMENT_POLL_TIMEOUT_MS ?? 60_000
+);
+export const SYNC_FULFILLMENT_POLL_INTERVAL_MS = Number(
+  process.env.SYNC_FULFILLMENT_POLL_INTERVAL_MS ?? 5_000
+);
+/** Required distinct deleted_at count after OUT — 2 (NULL + timestamp) = PASS, 1 = FAIL. */
+export const ORDER_FULFILLMENT_REQUIRED_DELETED_AT_DISTINCT = Number(
+  process.env.ORDER_FULFILLMENT_REQUIRED_DELETED_AT_DISTINCT ?? 2
+);
 
 export interface DbConfig {
   host: string;
@@ -799,4 +813,300 @@ export async function verifyOrderPaymentSyncedInDb(
   console.log(`  Match      : YES ✓`);
 
   return { orderId, transaction, reference: actualRef };
+}
+
+// ─── order_fulfillment (after WH/OUT) ───────────────────────────────────────
+
+export type OrderFulfillmentRow = Record<string, unknown> & {
+  id: string;
+  order_id: string;
+  deleted_at: Date | string | null;
+};
+
+/** Normalize deleted_at for distinct counting: NULL vs timestamp. */
+export function deletedAtKey(deletedAt: unknown): string {
+  if (deletedAt == null) return 'NULL';
+  return String(deletedAt);
+}
+
+/** Human-readable summary of distinct deleted_at values. */
+export function summarizeDistinctDeletedAt(distinct: string[]): string {
+  const hasNull = distinct.includes('NULL');
+  const tsCount = distinct.filter((d) => d !== 'NULL').length;
+
+  if (hasNull && tsCount === 1) return 'NULL + timestamp → PASS pattern';
+  if (!hasNull && tsCount >= 1) {
+    return `timestamp + timestamp (${tsCount} row(s) deleted, no NULL) → FAIL`;
+  }
+  if (hasNull && tsCount === 0) return 'NULL only (no soft-deleted row) → FAIL';
+  return `[${distinct.map((d) => (d === 'NULL' ? 'NULL' : 'timestamp')).join(', ')}]`;
+}
+
+export function distinctDeletedAtValues(
+  rows: OrderFulfillmentRow[]
+): string[] {
+  return [...new Set(rows.map((r) => deletedAtKey(r.deleted_at)))];
+}
+
+/**
+ * SELECT * FROM public.order_fulfillment WHERE order_id = $1
+ */
+export async function findOrderFulfillmentsByOrderId(
+  orderId: string,
+  opts?: { quiet?: boolean }
+): Promise<OrderFulfillmentRow[]> {
+  const sql = `SELECT * FROM public.order_fulfillment WHERE order_id = $1 ORDER BY created_at ASC`;
+
+  if (!opts?.quiet) {
+    logDbStep('6/7', 'Query order_fulfillment', sql.replace('$1', `'${orderId}'`));
+  }
+
+  const client = await connectToDatabase(!opts?.quiet);
+  try {
+    const result = await client.query(sql, [orderId]);
+    if (!opts?.quiet) {
+      logDbStep('6/7', `order_fulfillment: ${result.rows.length} row(s)`);
+    }
+    const rows = result.rows as OrderFulfillmentRow[];
+    assertOrderFulfillmentRowsMatchOrderId(rows, orderId);
+    return rows;
+  } finally {
+    await client.end();
+  }
+}
+
+/** Every row must use the same Medusa order_id we queried (not mixed orders). */
+export function assertOrderFulfillmentRowsMatchOrderId(
+  rows: OrderFulfillmentRow[],
+  expectedOrderId: string
+): void {
+  const expected = expectedOrderId.trim();
+  if (!expected) {
+    throw new Error('assertOrderFulfillmentRowsMatchOrderId: expectedOrderId is empty');
+  }
+
+  const orderIds = new Set<string>();
+  for (const row of rows) {
+    const rowOrderId = String(row.order_id ?? '').trim();
+    orderIds.add(rowOrderId);
+    if (rowOrderId !== expected) {
+      throw new Error(
+        `order_fulfillment row ordful id=${row.id} has order_id="${rowOrderId}", ` +
+          `expected "${expected}" for this test order`
+      );
+    }
+  }
+
+  if (orderIds.size > 1) {
+    throw new Error(
+      `order_fulfillment rows have mixed order_id values: ${[...orderIds].join(', ')}`
+    );
+  }
+}
+
+export function logOrderFulfillments(
+  label: string,
+  rows: OrderFulfillmentRow[],
+  expectedOrderId?: string
+): void {
+  console.log(`\n  ${label}`);
+  if (expectedOrderId) {
+    console.log(`  expected order_id (all rows): ${expectedOrderId}`);
+  }
+  if (rows.length === 0) {
+    console.log('  (no rows)');
+    return;
+  }
+  const distinct = distinctDeletedAtValues(rows);
+  const orderIds = [...new Set(rows.map((r) => String(r.order_id ?? '')))];
+  console.log('  ┌────┬──────────────────────────────┬─────────────────────────┐');
+  console.log('  │ #  │ order_id                     │ deleted_at              │');
+  rows.forEach((r, i) => {
+    const oid = String(r.order_id ?? '').slice(0, 28).padEnd(28);
+    const del =
+      r.deleted_at == null
+        ? 'NULL'
+        : String(r.deleted_at).slice(0, 23);
+    console.log(`  │ ${String(i + 1).padStart(2)} │ ${oid} │ ${del.padEnd(23)} │`);
+  });
+  console.log('  └────┴──────────────────────────────┴─────────────────────────┘');
+  console.log(
+    `  order_id (${orderIds.length}): ${orderIds.join(', ')}${orderIds.length === 1 && orderIds[0] === expectedOrderId ? ' ✓' : ''}`
+  );
+  console.log(`  deleted_at check       : ${summarizeDistinctDeletedAt(distinct)}`);
+}
+
+export interface OrderFulfillmentCheckResult {
+  orderId: string;
+  rows: OrderFulfillmentRow[];
+  distinctDeletedAt: string[];
+  passed: boolean;
+  reason: string;
+}
+
+/**
+ * PASS: one row deleted_at NULL + one row with a timestamp (2 distinct).
+ * FAIL: only NULL, only timestamp(s), or timestamp + timestamp (no NULL).
+ */
+export function orderFulfillmentDeletedAtOutcome(
+  rows: OrderFulfillmentRow[]
+): { passed: boolean; reason: string; distinctDeletedAt: string[] } {
+  const distinctDeletedAt = distinctDeletedAtValues(rows);
+  const hasNull = distinctDeletedAt.includes('NULL');
+  const hasTimestamp = distinctDeletedAt.some((d) => d !== 'NULL');
+
+  if (rows.length < 2) {
+    return {
+      passed: false,
+      reason: `expected ≥2 fulfillment rows, got ${rows.length}`,
+      distinctDeletedAt,
+    };
+  }
+
+  if (!hasNull && hasTimestamp) {
+    return {
+      passed: false,
+      reason: 'timestamp + timestamp (no NULL)',
+      distinctDeletedAt,
+    };
+  }
+
+  if (hasNull && !hasTimestamp) {
+    return {
+      passed: false,
+      reason: 'NULL only (missing soft-deleted row with timestamp)',
+      distinctDeletedAt,
+    };
+  }
+
+  if (hasNull && hasTimestamp && distinctDeletedAt.length === 2) {
+    return {
+      passed: true,
+      reason: 'NULL + timestamp',
+      distinctDeletedAt,
+    };
+  }
+
+  return {
+    passed: false,
+    reason: `unexpected pattern (${distinctDeletedAt.length} distinct)`,
+    distinctDeletedAt,
+  };
+}
+
+/** Definitive FAIL — polling will not change outcome (e.g. timestamp + timestamp). */
+export function isDefinitiveFulfillmentFailure(reason: string): boolean {
+  return (
+    reason === 'timestamp + timestamp (no NULL)' ||
+    reason.startsWith('unexpected pattern')
+  );
+}
+
+export function evaluateOrderFulfillmentDeletedAt(
+  rows: OrderFulfillmentRow[],
+  _requiredDistinct = ORDER_FULFILLMENT_REQUIRED_DELETED_AT_DISTINCT,
+  opts?: { quiet?: boolean }
+): OrderFulfillmentCheckResult {
+  const { passed, reason, distinctDeletedAt } =
+    orderFulfillmentDeletedAtOutcome(rows);
+
+  if (!opts?.quiet) {
+    console.log('\n────────── order_fulfillment deleted_at check ──────────');
+    console.log(`  row count              : ${rows.length}`);
+    console.log(`  deleted_at pattern     : ${summarizeDistinctDeletedAt(distinctDeletedAt)}`);
+    console.log('  PASS pattern         : NULL + timestamp');
+    console.log('  FAIL patterns        : NULL only | timestamp + timestamp');
+    console.log(`  Result               : ${reason} → ${passed ? 'PASSED ✓' : 'FAILED ✗'}`);
+  }
+
+  return {
+    orderId: String(rows[0]?.order_id ?? ''),
+    rows,
+    distinctDeletedAt,
+    passed,
+    reason,
+  };
+}
+
+export async function waitForOrderFulfillmentAfterOut(
+  orderId: string,
+  opts?: {
+    requiredDistinct?: number;
+    initialWaitMs?: number;
+    pollTimeoutMs?: number;
+    intervalMs?: number;
+  }
+): Promise<OrderFulfillmentCheckResult> {
+  const requiredDistinct =
+    opts?.requiredDistinct ?? ORDER_FULFILLMENT_REQUIRED_DELETED_AT_DISTINCT;
+  const initialWaitMs = opts?.initialWaitMs ?? SYNC_FULFILLMENT_WAIT_MS;
+  const pollTimeoutMs = opts?.pollTimeoutMs ?? SYNC_FULFILLMENT_POLL_TIMEOUT_MS;
+  const intervalMs = opts?.intervalMs ?? SYNC_FULFILLMENT_POLL_INTERVAL_MS;
+
+  console.log('\n────────── Wait for order_fulfillment after OUT ──────────');
+  logDbStep(
+    '5/7',
+    `Initial wait ${Math.round(initialWaitMs / 1000)}s (SYNC_FULFILLMENT_WAIT_MS)`,
+    'fulfillment sync after WH/OUT validate'
+  );
+  await new Promise((r) => setTimeout(r, initialWaitMs));
+
+  logDbStep(
+    '7/7',
+    `Polling every ${intervalMs / 1000}s for up to ${Math.round(pollTimeoutMs / 1000)}s`,
+    `order_id=${orderId}  PASS when 2 distinct deleted_at (NULL + timestamp)`
+  );
+
+  const deadline = Date.now() + pollTimeoutMs;
+  let attempt = 0;
+  let last: OrderFulfillmentCheckResult | null = null;
+
+  while (Date.now() < deadline) {
+    attempt += 1;
+    const rows = await findOrderFulfillmentsByOrderId(orderId, { quiet: true });
+    last = evaluateOrderFulfillmentDeletedAt(rows, requiredDistinct, { quiet: true });
+    const status = last.passed ? 'PASSED ✓' : 'FAILED ✗';
+    console.log(
+      `         poll #${attempt}: ${rows.length} row(s) — ${last.reason} → ${status}`
+    );
+
+    if (last.passed) {
+      evaluateOrderFulfillmentDeletedAt(rows, requiredDistinct);
+      logDbStep('7/7', 'order_fulfillment check PASSED', last.distinctDeletedAt.join(' + '));
+      logOrderFulfillments('order_fulfillment rows:', rows, orderId);
+      return last;
+    }
+
+    if (isDefinitiveFulfillmentFailure(last.reason)) {
+      evaluateOrderFulfillmentDeletedAt(rows, requiredDistinct);
+      logOrderFulfillments('order_fulfillment rows:', rows, orderId);
+      throw new Error(
+        `order_fulfillment check FAILED for order_id="${orderId}": ${last.reason}. ` +
+          'Expected NULL + timestamp after WH/OUT; got two timestamped rows (no active NULL row).'
+      );
+    }
+
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+
+  if (last) {
+    evaluateOrderFulfillmentDeletedAt(last.rows, requiredDistinct);
+    logOrderFulfillments('order_fulfillment rows (last poll):', last.rows, orderId);
+  }
+  throw new Error(
+    `order_fulfillment check FAILED for order_id="${orderId}": ${last?.reason ?? 'unknown'} ` +
+      `(timed out after ${Math.round(pollTimeoutMs / 1000)}s — still waiting for NULL + timestamp).`
+  );
+}
+
+export async function verifyOrderFulfillmentAfterOut(
+  orderId: string
+): Promise<OrderFulfillmentCheckResult> {
+  const result = await waitForOrderFulfillmentAfterOut(orderId);
+  if (!result.passed) {
+    throw new Error(
+      `order_fulfillment deleted_at: ${result.reason} — [${result.distinctDeletedAt.join(', ')}]`
+    );
+  }
+  return result;
 }

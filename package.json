@@ -24,7 +24,8 @@
     "db:ping": "node scripts/db-ping.js",
     "db:query": "node scripts/db-query.js",
     "db:recent": "node scripts/db-recent-odoo-orders.js",
-    "db:transactions": "node scripts/db-order-transactions.js"
+    "db:transactions": "node scripts/db-order-transactions.js",
+    "db:fulfillment": "node scripts/db-order-fulfillment.js"
   },
   "dependencies": {
     "dotenv": "^16.6.1",
